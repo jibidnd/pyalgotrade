@@ -43,30 +43,48 @@ class BaseStrategy(object):
 
     .. note::
         This is a base class and should not be used directly.
+
+    1/22/2022: adding tradeFeed and quoteFeed and making barFeed and broker optional
     """
 
     LOGGER_NAME = "strategy"
 
-    def __init__(self, barFeed, broker):
+    def __init__(self, barFeed = None, broker = None, tradeFeed = None, quoteFeed = None):
+        
         self.__barFeed = barFeed
+        self.__tradeFeed = tradeFeed
+        self.__quoteFeed = quoteFeed
         self.__broker = broker
+
         self.__activePositions = set()
         self.__orderToPosition = {}
-        self.__barsProcessedEvent = observer.Event()
+        
         self.__analyzers = []
         self.__namedAnalyzers = {}
         self.__resampledBarFeeds = []
+
         self.__dispatcher = dispatcher.Dispatcher()
-        self.__broker.getOrderUpdatedEvent().subscribe(self.__onOrderEvent)
-        self.__barFeed.getNewValuesEvent().subscribe(self.__onBars)
 
         # onStart will be called once all subjects are started.
         self.__dispatcher.getStartEvent().subscribe(self.onStart)
         self.__dispatcher.getIdleEvent().subscribe(self.__onIdle)
-
+        
         # It is important to dispatch broker events before feed events, specially if we're backtesting.
-        self.__dispatcher.addSubject(self.__broker)
-        self.__dispatcher.addSubject(self.__barFeed)
+        if self.broker is not None:
+            self.__broker.getOrderUpdatedEvent().subscribe(self.__onOrderEvent)
+            self.__dispatcher.addSubject(self.__broker)
+        if self.__barFeed is not None:
+            self.__barsProcessedEvent = observer.Event()
+            self.__barFeed.getNewValuesEvent().subscribe(self.__onBars)
+            self.__dispatcher.addSubject(self.__barFeed)
+        if self.__tradeFeed is not None:
+            self.__tradesProcessedEvent = observer.Event()
+            self.__tradeFeed.getNewValuesEvent().subscribe(self.__onTrades)
+            self.__dispatcher.addSubject(self.__tradeFeed)
+        if self.__quoteFeed is not None:
+            self.__quotesProcessedEvent = observer.Event()
+            self.__quoteFeed.getNewValuesEvent().subscribe(self.__onQuotes)
+            self.__dispatcher.addSubject(self.__quoteFeed)
 
         # Initialize logging.
         self.__logger = logger.getLogger(BaseStrategy.LOGGER_NAME)
@@ -98,6 +116,12 @@ class BaseStrategy(object):
 
     def getBarsProcessedEvent(self):
         return self.__barsProcessedEvent
+    
+    def getTradesProcessedEvent(self):
+        return self.__tradesProcessedEvent
+
+    def getQuotesProcessedEvent(self):
+        return self.__quotesProcessedEvent
 
     def getUseAdjustedValues(self):
         return False
@@ -137,8 +161,18 @@ class BaseStrategy(object):
         return ret
 
     def getFeed(self):
-        """Returns the :class:`pyalgotrade.barfeed.BaseBarFeed` that this strategy is using."""
-        return self.__barFeed
+        """Returns the :class:`pyalgotrade.barfeed.BaseBarFeed` that this strategy is using.
+            if no bar feed, attempts to return trade feed.
+            if no trade feed, attempts to return quote feed.
+        """
+        if self.__barFeed is not None:
+            return self.__barFeed
+        elif self.__tradeFeed is not None:
+            return self.__tradeFeed
+        elif self.__quoteFeed is not None:
+            return self.__quoteFeed
+        else:
+            raise AttributeError("Strategy does not have a data feed.")
 
     def getBroker(self):
         """Returns the :class:`pyalgotrade.broker.Broker` used to handle order executions."""
@@ -468,6 +502,28 @@ class BaseStrategy(object):
         """
         raise NotImplementedError()
 
+    @abc.abstractmethod
+    def onTrades(self, trade):
+        """Override (**mandatory**) to get notified when new trades are available. The default implementation raises an Exception.
+
+        **This is the method to override to enter your trading logic and enter/exit positions**.
+
+        :param trades: The current trades.
+        :type trades: :class:`pyalgotrade.trade.Trades`.
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def onQuotes(self, quote):
+        """Override (**mandatory**) to get notified when new quotes are available. The default implementation raises an Exception.
+
+        **This is the method to override to enter your trading logic and enter/exit positions**.
+
+        :param quotes: The current quotes.
+        :type quotes: :class:`pyalgotrade.quote.Quotes`.
+        """
+        raise NotImplementedError()
+
     def onOrderUpdated(self, order):
         """Override (optional) to get notified when an order gets updated.
 
@@ -508,15 +564,54 @@ class BaseStrategy(object):
 
         # 3: Notify that the bars were processed.
         self.__barsProcessedEvent.emit(self, bars)
+    
+    def __onTrades(self, dateTime, trades):
+        # THE ORDER HERE IS VERY IMPORTANT
+
+        # 1: Let analyzers process trades.
+        self.__notifyAnalyzers(lambda s: s.beforeOnTrades(self, trades))
+
+        # 2: Let the strategy process current trades and submit orders.
+        self.onTrades(trades)
+
+        # 3: Notify that the trades were processed.
+        self.__tradesProcessedEvent.emit(self, trades)
+
+    def __onQuotes(self, dateTime, quotes):
+        # THE ORDER HERE IS VERY IMPORTANT
+
+        # 1: Let analyzers process quotes.
+        self.__notifyAnalyzers(lambda s: s.beforeOnQuotes(self, quotes))
+
+        # 2: Let the strategy process current quotes and submit orders.
+        self.onQuotes(quotes)
+
+        # 3: Notify that the quotes were processed.
+        self.__quotesProcessedEvent.emit(self, quotes)
 
     def run(self):
         """Call once (**and only once**) to run the strategy."""
         self.__dispatcher.run()
 
-        if self.__barFeed.getCurrentBars() is not None:
-            self.onFinish(self.__barFeed.getCurrentBars())
-        else:
-            raise Exception("Feed was empty")
+        feeds_empty = True
+
+        if self.__barFeed is not None:
+            if (currentBar := self.__barFeed.getCurrentBars()) is not None:
+                self.onFinish(currentBar)
+                feed_empty = False
+        
+        if self.__tradeFeed is not None:
+            if (currentTrade := self.__tradeFeed.getCurrentTrades()) is not None:
+                self.onFinish(currentTrade)
+                feed_empty = False
+        
+        if self.__quoteFeed is not None:
+            if (currentQuote := self.__quoteFeed.getCurrentQuotes()) is not None:
+                self.onFinish(currentQuote)
+                feed_empty = False
+        
+        if feeds_empty:
+            self.getLogger.info("Feed was empty")
 
     def stop(self):
         """Stops a running strategy."""
@@ -576,7 +671,7 @@ class BacktestingStrategy(BaseStrategy):
         This is a base class and should not be used directly.
     """
 
-    def __init__(self, barFeed, cash_or_brk=1000000):
+    def __init__(self, barFeed = None, cash_or_brk=1000000, tradeFeed = None, quoteFeed = None):
         # The broker should subscribe to barFeed events before the strategy.
         # This is to avoid executing orders submitted in the current tick.
 
@@ -585,7 +680,7 @@ class BacktestingStrategy(BaseStrategy):
         else:
             broker = backtesting.Broker(cash_or_brk, barFeed)
 
-        BaseStrategy.__init__(self, barFeed, broker)
+        BaseStrategy.__init__(self, barFeed, broker, tradeFeed, quoteFeed)
         self.__useAdjustedValues = False
         self.setUseEventDateTimeInLogs(True)
         self.setDebugMode(True)

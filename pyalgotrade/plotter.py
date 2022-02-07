@@ -238,11 +238,15 @@ class Subplot(object):
         self.__callbacks[callback] = self.getSeries(label, defaultClass)
 
     def addCallback(self, label, callback, defaultClass=LineMarker):
-        """Add a callback that will be called on each bar.
+        """Add a callback that will be called on each data point.
 
         :param label: A name for the series values.
         :type label: string.
-        :param callback: A function that receives a :class:`pyalgotrade.bar.Bars` instance as a parameter and returns a number or None.
+        :param callback: A function that receives a data point instance as a parameter and returns a number or None.
+            the data point can be one of:
+                :class:`pyalgotrade.bar.Bar`
+                :class:`pyalgotrade.trade.Trade`
+                :class:`pyalgotrade.quote.Quote`
         """
         self.__callbacks[callback] = self.getSeries(label, defaultClass)
 
@@ -260,6 +264,16 @@ class Subplot(object):
         dateTime = bars.getDateTime()
         for cb, series in six.iteritems(self.__callbacks):
             series.addValue(dateTime, cb(bars))
+    
+    def onTrades(self, trades):
+        dateTime = trades.getDateTime()
+        for cb, series in six.iteritems(self.__callbacks):
+            series.addValue(dateTime, cb(trades))
+
+    def onQuotes(self, quotes):
+        dateTime = quotes.getDateTime()
+        for cb, series in six.iteritems(self.__callbacks):
+            series.addValue(dateTime, cb(quotes))
 
     def getSeries(self, name, defaultClass=LineMarker):
         try:
@@ -299,6 +313,20 @@ class InstrumentSubplot(Subplot):
         if bar:
             dateTime = bars.getDateTime()
             self.__instrumentSeries.addValue(dateTime, bar)
+    
+    def onTrades(self, trades):
+        super(InstrumentSubplot, self).onTrades(trades)
+        trade = trades.getTrade(self.__instrument)
+        if trade:
+            dateTime = trades.getDateTime()
+            self.__instrumentSeries.addValue(dateTime, trade)
+    
+    def onQuotes(self, quotes):
+        super(InstrumentSubplot, self).onQuotes(quotes)
+        quote = quotes.getQuote(self.__instrument)
+        if quote:
+            dateTime = quotes.getDateTime()
+            self.__instrumentSeries.addValue(dateTime, quote)
 
     def onOrderEvent(self, broker_, orderEvent):
         order = orderEvent.getOrder()
@@ -330,12 +358,17 @@ class StrategyPlotter(object):
         self.__plotAllInstruments = plotAllInstruments
         self.__plotBuySell = plotBuySell
         self.__barSubplots = {}
+        self.__quoteSubplots = {}
+        self.__tradeSubplots = {}
         self.__namedSubplots = collections.OrderedDict()
         self.__portfolioSubplot = None
         if plotPortfolio:
             self.__portfolioSubplot = Subplot()
 
         strat.getBarsProcessedEvent().subscribe(self.__onBarsProcessed)
+        strat.getTradesProcessedEvent().subscribe(self.__onTradesProcessed)
+        strat.getQuotesProcessedEvent().subscribe(self.__onQuotesProcessed)
+
         strat.getBroker().getOrderUpdatedEvent().subscribe(self.__onOrderEvent)
 
     def __checkCreateInstrumentSubplot(self, instrument):
@@ -364,9 +397,59 @@ class StrategyPlotter(object):
             # This is in case additional dataseries were added to the portfolio subplot.
             self.__portfolioSubplot.onBars(bars)
 
+    def __onTradesProcessed(self, strat, trades):
+        dateTime = trades.getDateTime()
+        self.__dateTimes.add(dateTime)
+
+        if self.__plotAllInstruments:
+            for instrument in trades.getInstruments():
+                self.__checkCreateInstrumentSubplot(instrument)
+
+        # Notify named subplots.
+        for subplot in self.__namedSubplots.values():
+            subplot.onTrades(trades)
+
+        # Notify trade subplots.
+        for subplot in self.__tradeSubplots.values():
+            subplot.onTrades(trades)
+
+        # Feed the portfolio evolution subplot.
+        if self.__portfolioSubplot:
+            self.__portfolioSubplot.getSeries("Portfolio").addValue(dateTime, strat.getBroker().getEquity())
+            # This is in case additional dataseries were added to the portfolio subplot.
+            self.__portfolioSubplot.onTrades(trades)
+
+    def __onQuotesProcessed(self, strat, quotes):
+        dateTime = quotes.getDateTime()
+        self.__dateTimes.add(dateTime)
+
+        if self.__plotAllInstruments:
+            for instrument in quotes.getInstruments():
+                self.__checkCreateInstrumentSubplot(instrument)
+
+        # Notify named subplots.
+        for subplot in self.__namedSubplots.values():
+            subplot.onQuotes(quotes)
+
+        # Notify quote subplots.
+        for subplot in self.__quoteSubplots.values():
+            subplot.onQuotes(quotes)
+
+        # Feed the portfolio evolution subplot.
+        if self.__portfolioSubplot:
+            self.__portfolioSubplot.getSeries("Portfolio").addValue(dateTime, strat.getBroker().getEquity())
+            # This is in case additional dataseries were added to the portfolio subplot.
+            self.__portfolioSubplot.onQuotes(quotes)
+
     def __onOrderEvent(self, broker_, orderEvent):
         # Notify BarSubplots
         for subplot in self.__barSubplots.values():
+            subplot.onOrderEvent(broker_, orderEvent)
+        
+        for subplot in self.__tradeSubplots.values():
+            subplot.onOrderEvent(broker_, orderEvent)
+        
+        for subplot in self.__quoteSubplots.values():
             subplot.onOrderEvent(broker_, orderEvent)
 
     def getInstrumentSubplot(self, instrument):
@@ -379,6 +462,33 @@ class StrategyPlotter(object):
         except KeyError:
             ret = InstrumentSubplot(instrument, self.__plotBuySell)
             self.__barSubplots[instrument] = ret
+        return ret
+
+    def getInstrumentBarSubplot(self, instrument):
+        return self.getInstrumentSubplot(instrument)
+    
+    def getInstrumentTradeSubplot(self, instrument):
+        """Returns the InstrumentSubplot for a given instrument
+
+        :rtype: :class:`InstrumentSubplot`.
+        """
+        try:
+            ret = self.__tradeSubplots[instrument]
+        except KeyError:
+            ret = InstrumentSubplot(instrument, self.__plotBuySell)
+            self.__tradeSubplots[instrument] = ret
+        return ret
+
+    def getInstrumentQuoteSubplot(self, instrument):
+        """Returns the InstrumentSubplot for a given instrument
+
+        :rtype: :class:`InstrumentSubplot`.
+        """
+        try:
+            ret = self.__quoteSubplots[instrument]
+        except KeyError:
+            ret = InstrumentSubplot(instrument, self.__plotBuySell)
+            self.__quoteSubplots[instrument] = ret
         return ret
 
     def getOrCreateSubplot(self, name):

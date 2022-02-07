@@ -16,6 +16,11 @@
 
 """
 .. moduleauthor:: Gabriel Martin Becedillas Ruiz <gabriel.becedillas@gmail.com>
+.. moduleauthor:: Robert Lee
+
+    1/22/2022: Even though there are mentionings to bars here, nothing here is bar specific,
+    and can apply to trades and quotes.
+
 """
 
 import numpy as np

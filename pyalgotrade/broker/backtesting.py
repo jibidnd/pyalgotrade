@@ -109,7 +109,7 @@ class BacktestingOrder(object):
 
     # Override to call the fill strategy using the concrete order type.
     # return FillInfo or None if the order should not be filled.
-    def process(self, broker_, bar_):
+    def process(self, broker_, data):
         raise NotImplementedError()
 
 
@@ -117,16 +117,16 @@ class MarketOrder(broker.MarketOrder, BacktestingOrder):
     def __init__(self, action, instrument, quantity, onClose, instrumentTraits):
         super(MarketOrder, self).__init__(action, instrument, quantity, onClose, instrumentTraits)
 
-    def process(self, broker_, bar_):
-        return broker_.getFillStrategy().fillMarketOrder(broker_, self, bar_)
+    def process(self, broker_, data):
+        return broker_.getFillStrategy().fillMarketOrder(broker_, self, data)
 
 
 class LimitOrder(broker.LimitOrder, BacktestingOrder):
     def __init__(self, action, instrument, limitPrice, quantity, instrumentTraits):
         super(LimitOrder, self).__init__(action, instrument, limitPrice, quantity, instrumentTraits)
 
-    def process(self, broker_, bar_):
-        return broker_.getFillStrategy().fillLimitOrder(broker_, self, bar_)
+    def process(self, broker_, data):
+        return broker_.getFillStrategy().fillLimitOrder(broker_, self, data)
 
 
 class StopOrder(broker.StopOrder, BacktestingOrder):
@@ -134,8 +134,8 @@ class StopOrder(broker.StopOrder, BacktestingOrder):
         super(StopOrder, self).__init__(action, instrument, stopPrice, quantity, instrumentTraits)
         self.__stopHit = False
 
-    def process(self, broker_, bar_):
-        return broker_.getFillStrategy().fillStopOrder(broker_, self, bar_)
+    def process(self, broker_, data):
+        return broker_.getFillStrategy().fillStopOrder(broker_, self, data)
 
     def setStopHit(self, stopHit):
         self.__stopHit = stopHit
@@ -161,8 +161,8 @@ class StopLimitOrder(broker.StopLimitOrder, BacktestingOrder):
         # TODO: Deprecated since v0.15. Use getStopHit instead.
         return self.__stopHit
 
-    def process(self, broker_, bar_):
-        return broker_.getFillStrategy().fillStopLimitOrder(broker_, self, bar_)
+    def process(self, broker_, data):
+        return broker_.getFillStrategy().fillStopLimitOrder(broker_, self, data)
 
 
 ######################################################################
@@ -181,7 +181,7 @@ class Broker(broker.Broker):
 
     LOGGER_NAME = "broker.backtesting"
 
-    def __init__(self, cash, barFeed, commission=None):
+    def __init__(self, cash, barFeed = None, commission=None, tradeFeed = None):
         super(Broker, self).__init__()
 
         assert(cash >= 0)
@@ -197,9 +197,16 @@ class Broker(broker.Broker):
         self.__fillStrategy = fillstrategy.DefaultStrategy()
         self.__logger = logger.getLogger(Broker.LOGGER_NAME)
 
+        assert not ((barFeed is None) and (tradeFeed is None)), \
+            'One of barFeed and tradeFeed must be provided.'
+
         # It is VERY important that the broker subscribes to barfeed events before the strategy.
         barFeed.getNewValuesEvent().subscribe(self.onBars)
         self.__barFeed = barFeed
+
+        tradeFeed.getNewValuesEvent().subscribe(self.onTrades)
+        self.__tradefeed = tradeFeed
+
         self.__allowNegativeCash = False
         self.__nextOrderId = 1
         self.__started = False
@@ -213,6 +220,12 @@ class Broker(broker.Broker):
         ret = bars.getBar(instrument)
         if ret is None:
             ret = self.__barFeed.getLastBar(instrument)
+        return ret
+
+    def _getTrade(self, trades, instrument):
+        ret = trades.getTrade(instrument)
+        if ret is None:
+            ret = self.__tradeFeed.getLastTrade(instrument)
         return ret
 
     def _registerOrder(self, order):
@@ -404,12 +417,13 @@ class Broker(broker.Broker):
             raise Exception("The order was already processed")
 
     # Return True if further processing is needed.
-    def __preProcessOrder(self, order, bar_):
+    def __preProcessOrder(self, order, data):
+        # data is either a bar or a trade
         ret = True
 
         # For non-GTC orders we need to check if the order has expired.
         if not order.getGoodTillCanceled():
-            expired = bar_.getDateTime().date() > order.getAcceptedDateTime().date()
+            expired = data.getDateTime().date() > order.getAcceptedDateTime().date()
 
             # Cancel the order if it is expired.
             if expired:
@@ -420,13 +434,14 @@ class Broker(broker.Broker):
 
         return ret
 
-    def __postProcessOrder(self, order, bar_):
+    def __postProcessOrder(self, order, data):
+        # data is either a bar or a trade.
         # For non-GTC orders and daily (or greater) bars we need to check if orders should expire right now
         # before waiting for the next bar.
         if not order.getGoodTillCanceled():
             expired = False
             if self.__barFeed.getFrequency() >= pyalgotrade.bar.Frequency.DAY:
-                expired = bar_.getDateTime().date() >= order.getAcceptedDateTime().date()
+                expired = data.getDateTime().date() >= order.getAcceptedDateTime().date()
 
             # Cancel the order if it will expire in the next bar.
             if expired:
@@ -434,17 +449,18 @@ class Broker(broker.Broker):
                 order.switchState(broker.Order.State.CANCELED)
                 self.notifyOrderEvent(broker.OrderEvent(order, broker.OrderEvent.Type.CANCELED, "Expired"))
 
-    def __processOrder(self, order, bar_):
-        if not self.__preProcessOrder(order, bar_):
+    def __processOrder(self, order, data):
+        # data is either a bar or a trade
+        if not self.__preProcessOrder(order, data):
             return
 
         # Double dispatch to the fill strategy using the concrete order type.
-        fillInfo = order.process(self, bar_)
+        fillInfo = order.process(self, data)
         if fillInfo is not None:
-            self.commitOrderExecution(order, bar_.getDateTime(), fillInfo)
+            self.commitOrderExecution(order, data.getDateTime(), fillInfo)
 
         if order.isActive():
-            self.__postProcessOrder(order, bar_)
+            self.__postProcessOrder(order, data)
 
     def __onBarsImpl(self, order, bars):
         # IF WE'RE DEALING WITH MULTIPLE INSTRUMENTS WE SKIP ORDER PROCESSING IF THERE IS NO BAR FOR THE ORDER'S
@@ -465,6 +481,26 @@ class Broker(broker.Broker):
                 # have been removed.
                 assert(order.isCanceled())
                 assert(order not in self.__activeOrders)
+    
+    def __onTradesImpl(self, order, trades):
+        # IF WE'RE DEALING WITH MULTIPLE INSTRUMENTS WE SKIP ORDER PROCESSING IF THERE IS NO BAR FOR THE ORDER'S
+        # INSTRUMENT TO GET THE SAME BEHAVIOUR AS IF WERE BE PROCESSING ONLY ONE INSTRUMENT.
+        trade_ = trades.getTrade(order.getInstrument())
+        if trade_ is not None:
+            # Switch from SUBMITTED -> ACCEPTED
+            if order.isSubmitted():
+                order.setAcceptedDateTime(trade_.getDateTime())
+                order.switchState(broker.Order.State.ACCEPTED)
+                self.notifyOrderEvent(broker.OrderEvent(order, broker.OrderEvent.Type.ACCEPTED, None))
+
+            if order.isActive():
+                # This may trigger orders to be added/removed from __activeOrders.
+                self.__processOrder(order, trade_)
+            else:
+                # If an order is not active it should be because it was canceled in this same loop and it should
+                # have been removed.
+                assert(order.isCanceled())
+                assert(order not in self.__activeOrders)
 
     def onBars(self, dateTime, bars):
         # Let the fill strategy know that new bars are being processed.
@@ -477,6 +513,18 @@ class Broker(broker.Broker):
         for order in ordersToProcess:
             # This may trigger orders to be added/removed from __activeOrders.
             self.__onBarsImpl(order, bars)
+
+    def onTrades(self, dateTime, trades):
+        # Let the fill strategy know that new bars are being processed.
+        self.__fillStrategy.onTrades(self, trades)
+
+        # This is to froze the orders that will be processed in this event, to avoid new getting orders introduced
+        # and processed on this very same event.
+        ordersToProcess = list(self.__activeOrders.values())
+
+        for order in ordersToProcess:
+            # This may trigger orders to be added/removed from __activeOrders.
+            self.__onTradesImpl(order, trades)
 
     def start(self):
         super(Broker, self).start()
